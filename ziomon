@@ -1,0 +1,208 @@
+#!/usr/bin/env python
+#
+#
+
+import os
+import sys
+import glob
+import time
+import re
+import fnmatch
+import argparse
+
+#
+# The dataset name pattern matcher class cluster.
+#
+class dpattern(object):
+    """Abstract base class for dataset name pattern matchers.  Concrete subclasses should not be instantiated directly; rather, the dpattern.pattern_with_string() static method should be used to infer class based on the pattern string."""
+    
+    @staticmethod
+    def pattern_with_string(pattern_string):
+        """Use to create and return a new pattern matcher according to the format of the pattern_string."""
+        if len(pattern_string) > 0:
+            if pattern_string[0] == '~':
+                return regex_dpattern(pattern_string[1:])
+            else:
+                return glob_dpattern(pattern_string)
+        raise ValueError('Invalid pattern string: {:s}'.format(pattern_string))
+    def __init__(self, pattern_string):
+        pass
+    def is_match(self, in_string):
+        pass
+
+class regex_dpattern(dpattern):
+    """Concrete dataset name pattern matcher utilizing a regular expression."""
+    
+    def __init__(self, pattern_string):
+        self._pattern_regex = re.compile(pattern_string)
+    def is_match(self, in_string):
+        return self._pattern_regex.search(in_string) is not None
+
+class glob_dpattern(dpattern):
+    """Concrete dataset name pattern matcher utilizing a fnmatch globbing pattern."""
+    def __init__(self, pattern_string):
+        self._pattern_glob = pattern_string
+    def is_match(self, in_string):
+        return fnmatch.fnmatch(in_string, self._pattern_glob)
+
+
+#
+# The dataset with i/o statistics wrapper class.
+#
+class dataset(object):
+    """Wrapper for a ZFS dataset (object set) and its i/o statistics."""
+    
+    @staticmethod
+    def all_datasets(zpool_prefix):
+        objset_pattern = os.path.join(zpool_prefix, 'objset-0x*')
+        datasets = []
+        for objset in glob.iglob(objset_pattern):
+            datasets.append(dataset(objset))
+        return datasets
+    
+    def __init__(self, src_path):
+        self.dataset_name = None
+        self.metrics_last = None
+        self.timestamp_last = None
+        self.metrics_current = None
+        self.timestamp_current = None
+        self.src_path = src_path
+        self.read_stats()
+    
+    def __eq__(self, other):
+        if isinstance(other, dataset):
+            return self.dataset_name == other.dataset_name
+        return self.dataset_name == str(other)
+    def __ne__(self, other):
+        if isinstance(other, dataset):
+            return self.dataset_name != other.dataset_name
+        return self.dataset_name != str(other)
+    def __gt__(self, other):
+        if isinstance(other, dataset):
+            return self.dataset_name > other.dataset_name
+        return self.dataset_name > str(other)
+    def __ge__(self, other):
+        if isinstance(other, dataset):
+            return self.dataset_name >= other.dataset_name
+        return self.dataset_name >= str(other)
+    def __lt__(self, other):
+        if isinstance(other, dataset):
+            return self.dataset_name < other.dataset_name
+        return self.dataset_name < str(other)
+    def __le__(self, other):
+        if isinstance(other, dataset):
+            return self.dataset_name <= other.dataset_name
+        return self.dataset_name <= str(other)
+    
+    def read_stats(self):
+        metrics_current = {}
+        try:
+            with open(self.src_path) as fptr:
+                for line in fptr:
+                    pieces = line.split()
+                    if pieces[0] == 'dataset_name' and self.dataset_name is None:
+                        self.dataset_name = pieces[2]
+                    elif pieces[0][0] in 'abcdefghijklmnopqrstuvwxyz' and pieces[1] == '4':
+                        metrics_current[pieces[0]] = int(pieces[2])
+        except:
+            pass
+        finally:
+            if len(metrics_current) > 0:
+                self.metrics_last = self.metrics_current
+                self.timestamp_last = self.timestamp_current
+                self.metrics_current = metrics_current
+                self.timestamp_current = time.time()
+                return True
+        return False
+
+    def rates(self):
+        out_rates = None
+        if self.timestamp_last is not None:
+            delta_t = self.timestamp_current - self.timestamp_last
+            if delta_t > 0.0:
+                out_rates = {}
+                for metric in self.metrics_current:
+                    if metric in self.metrics_last:
+                        out_rates[metric] = float(self.metrics_current[metric] - self.metrics_last[metric]) / delta_t
+        return out_rates
+
+cli_parser = argparse.ArgumentParser(description='Watch ZFS per-dataset i/o stats.')
+cli_parser.add_argument('--zpool', '-p', metavar='name', required=True,
+            dest='zpool',
+            help='Which zpool to monitor'
+        )
+cli_parser.add_argument('--dataset', '-d', metavar='*|{+-}pattern',
+            action='append',
+            dest='dataset',
+            help='Which dataset(s) to monitor.  Use * to select all; -<pattern> to remove matches, +<pattern> to add matches (where <pattern> is a globbing pattern or a regular expression prefixed by "~").  Defaults to all datasets in the selected pool.'
+        )
+cli_parser.add_argument('--interval', '-i', metavar='seconds',
+            dest='interval',
+            type=float,
+            default=5.0,
+            help='Time period (in seconds) between i/o stat updates.  Default is 5 seconds.'
+        )
+
+
+cli_args = cli_parser.parse_args()
+
+#
+# Base directory for i/o stats:
+#
+zfs_io_stats_prefix = os.path.join('/proc/spl/kstat/zfs', cli_args.zpool)
+if not os.path.isdir(zfs_io_stats_prefix):
+    sys.stderr.write("ERROR:  zpool `{:s}` does not appear to exist\n".format(cli_args.zpool))
+    exit(1)
+
+#
+# Get all datasets so we can construct the target list:
+#
+all_datasets = dataset.all_datasets(zfs_io_stats_prefix)
+if cli_args.dataset is None:
+    target_datasets = all_datasets
+else:
+    target_datasets = []
+    for dataset_pattern in cli_args.dataset:
+        if dataset_pattern == '*':
+            target_datasets = []
+            target_datasets.extend(all_datasets)
+        elif len(dataset_pattern) > 1:
+            op = dataset_pattern[0]
+            if op not in '+-':
+                sys.stderr.write("ERROR:  invalid dataset pattern (no leading + or -): {:s}\n".format(dataset_pattern))
+                exit(1)
+            try:
+                matcher = dpattern.pattern_with_string(dataset_pattern[1:])
+                if op == '+':
+                    #
+                    # Add all_datasets records matching the pattern:
+                    #
+                    target_datasets.extend(filter(lambda ds:ds not in target_datasets and matcher.is_match(ds.dataset_name), all_datasets))
+                elif op == '-':
+                    #
+                    # Remove target_datasets records matching the pattern:
+                    #
+                    target_datasets = filter(lambda ds:not matcher.is_match(ds.dataset_name), target_datasets)
+            except Exception as E:
+                sys.stderr.write("ERROR:  invalid dataset pattern: {:s}\n".format(str(E)))
+                exit(1)
+
+#
+# If there are no datasets left, then we've got nothing to do:
+#
+if len(target_datasets) == 0:
+    sys.stderr.write("WARNING:  no datasets were selected\n")
+    exit(0)
+
+while True:
+    time.sleep(cli_args.interval)
+    header_shown = False
+    for ds in target_datasets:
+        ds.read_stats()
+        rates = ds.rates()
+        if rates['nwritten'] > 0.0 or rates['nread'] > 0.0 or rates['nunlinked'] > 0.0:
+            if not header_shown:
+                print('')
+                print('{:<24s} {:>12s} {:>12s} {:>12s}'.format('Dataset', 'Write B/s', 'Read B/s', 'Unlink/s'))
+                header_shown = True
+            print('{:<24s} {:>12.2f} {:>12.2f} {:>12.2f}'.format(ds.dataset_name, rates['nwritten'], rates['nread'], rates['nunlinked']))
